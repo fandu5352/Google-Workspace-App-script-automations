@@ -1,0 +1,399 @@
+<--
+ Google Apps Script to automate blog post creation in WordPress using Gemini API.
+ 
+  Instructions for Implementation:
+ 
+  1.  **Open Google Apps Script:**
+      - Go to script.google.com or open your Google Sheet, go to Extensions > Apps Script.
+ 
+  2.  **Paste the Code:**
+     - Replace any existing code in the script editor with the code provided below.
+ 
+  3.  **Configure Credentials (IMPORTANT - Use Script Properties for Security):**
+      - **Strongly Recommended:** Store your sensitive credentials securely using Script Properties.
+        - Go to `File > Project properties > Script properties`.
+        - Click `Add row`.
+        - Add the following properties and their corresponding values:
+          - `GEMINI_API_KEY`: Your Google Gemini API Key.
+          - `WP_URL`: Your WordPress site's REST API base URL (e.g., `https://yourwebsite.com/wp-json/wp/v2`).
+          - `WP_USERNAME`: Your WordPress username (usually email).
+          - `WP_APP_PASSWORD`: Your WordPress Application Password (NOT your regular password). Generate this in your WordPress dashboard under Users > Your Profile > Application Passwords.
+        - Click `Save script properties`.
+      - **If you MUST hardcode (NOT recommended for security):**
+        - Change `const SCRIPT_PROPERTIES_USED = true;` to `const SCRIPT_PROPERTIES_USED = false;`.
+        - Replace the placeholder values for `GEMINI_API_KEY_HARDCODED`, `WP_URL_HARDCODED`, `WP_USERNAME_HARDCODED`, and `WP_APP_PASSWORD_HARDCODED` below with your actual credentials.
+ 
+  4.  **Configure Sheet Settings:**
+      - Update the constants `SHEET_NAME`, `HEADER_ROWS`, `TOPIC_COL`, `CATEGORY_COL`, `STATUS_COL`, and `POST_URL_COL` to match your Google Sheet's structure.
+      - The default assumes:
+        - Sheet named 'BlogPosts'.
+        - 1 header row.
+        - Topic in Column A.
+        - Category in Column B.
+        - Status in Column D.
+        - Posted URL in Column E.
+ 
+  5.  **Set up the Google Sheet:**
+      - Create a sheet with the name specified in `SHEET_NAME`.
+      - Add header row(s) as specified in `HEADER_ROWS`.
+      - In the `TOPIC_COL`, enter the topics for the blog posts you want to generate and publish.
+      - In the `CATEGORY_COL`, enter the name of the WordPress category you want the post assigned to (optional, leave blank to post without a category).
+      - The script will read rows where the `STATUS_COL` is empty or contains the value specified in `STATUS_PENDING`.
+      - The script will update the `STATUS_COL` and `POST_URL_COL` after processing.
+ 
+  6.  **Run the Script:**
+      - Select the `processPendingBlogPosts` function from the dropdown menu in the Apps Script editor.
+      - Click the `Run` button (play icon).
+      - You may be asked to authorize the script to access external services (like UrlFetchApp for API calls) and your spreadsheet. Review the permissions and authorize.
+      - The script will process the first pending row it finds and stop (due to the `break` statement). Remove the `break` if you want it to process all pending rows in one run (be mindful of API limits).
+ 
+  7.  **Set up a Time-Driven Trigger (Optional, for Automation):**
+      - In the Apps Script editor, click the clock icon on the left sidebar (`Triggers`).
+      - Click `Add Trigger` in the bottom right.
+      - Choose `processPendingBlogPosts` as the function to run.
+      - Choose `Head` as the deployment.
+      - Select `Time-driven` as the event source.
+      - Configure the desired frequency (e.g., `Day timer`, `Hour timer`).
+      - Click `Save`.
+ 
+  8.  **Monitor Execution:**
+      - Check the `Executions` tab (list icon on the left sidebar) to see if the script ran successfully or if there were errors.
+      - Check the `Logger` output (`View > Logs`) for detailed information during execution.
+      - Check the Google Sheet for updated statuses and post URLs.
+ --/>
+
+<--
+  Configuration Area
+  !! IMPORTANT !! Configure credentials using Script Properties (File -> Project properties -> Script properties)
+  !! SECURITY !! Using Script Properties is highly recommended over hardcoding.
+ --/>
+const SCRIPT_PROPERTIES_USED = true; // Set to true IF you use Script Properties
+
+// --- Credentials (Only used if SCRIPT_PROPERTIES_USED is false - NOT RECOMMENDED) ---
+const GEMINI_API_KEY_HARDCODED = 'YOUR_GEMINI_API_KEY'; // <--- REPLACE WITH YOUR GEMINI API KEY IF NOT USING SCRIPT PROPERTIES
+const WP_URL_HARDCODED = 'YOUR_WP_SITE_URL/wp-json/wp/v2'; // <--- REPLACE WITH YOUR WP SITE URL + /wp-json/wp/v2 IF NOT USING SCRIPT PROPERTIES
+const WP_USERNAME_HARDCODED = 'YOUR_WP_USERNAME';         // <--- REPLACE WITH YOUR WP USERNAME IF NOT USING SCRIPT PROPERTIES
+const WP_APP_PASSWORD_HARDCODED = 'YOUR_WP_APPLICATION_PASSWORD'; // <--- REPLACE WITH YOUR WP APPLICATION PASSWORD IF NOT USING SCRIPT PROPERTIES
+
+// --- Sheet Configuration ---
+const SHEET_NAME = 'BlogPosts';
+const HEADER_ROWS = 1;
+const TOPIC_COL = 1;      // Column A
+const CATEGORY_COL = 2;   // Column B
+// const DATE_COL = 3;    // Column C - Currently unused but defined
+const STATUS_COL = 4;     // Column D
+const POST_URL_COL = 5;   // Column E
+
+// --- Constants ---
+const STATUS_PENDING = 'Pending';
+const STATUS_POSTED = 'Posted';
+const STATUS_ERROR_GEMINI = 'Error: Gemini Failed';
+const STATUS_ERROR_WP_CATEGORY = 'Error: WP Category Not Found';
+const STATUS_ERROR_WP_POST = 'Error: WP Post Failed';
+
+/**
+ * Retrieves configuration values.
+ */
+function getConfig() {
+  if (SCRIPT_PROPERTIES_USED) {
+    const scriptProperties = PropertiesService.getScriptProperties();
+    const config = {
+      GEMINI_API_KEY: scriptProperties.getProperty('GEMINI_API_KEY'),
+      WP_URL: scriptProperties.getProperty('WP_URL'),
+      WP_USERNAME: scriptProperties.getProperty('WP_USERNAME'),
+      WP_APP_PASSWORD: scriptProperties.getProperty('WP_APP_PASSWORD')
+    };
+    if (!config.GEMINI_API_KEY || !config.WP_URL || !config.WP_USERNAME || !config.WP_APP_PASSWORD) {
+      throw new Error("Script Properties are not set correctly. Please set GEMINI_API_KEY, WP_URL, WP_USERNAME, and WP_APP_PASSWORD in File -> Project properties -> Script properties.");
+    }
+    return config;
+  } else {
+    if (GEMINI_API_KEY_HARDCODED.startsWith('YOUR_') || WP_URL_HARDCODED.startsWith('YOUR_') || WP_USERNAME_HARDCODED.startsWith('YOUR_') || WP_APP_PASSWORD_HARDCODED.startsWith('YOUR_')) {
+       throw new Error("Please replace the placeholder credentials (GEMINI_API_KEY_HARDCODED, etc.) in the script with your actual values, or switch to using Script Properties.");
+    }
+    if (!WP_URL_HARDCODED.includes('/wp-json/wp/v2')) {
+       Logger.log("Warning: WP_URL_HARDCODED doesn't seem to end with '/wp-json/wp/v2'. Ensure it's the correct base REST API endpoint.");
+    }
+    return {
+      GEMINI_API_KEY: GEMINI_API_KEY_HARDCODED,
+      WP_URL: WP_URL_HARDCODED,
+      WP_USERNAME: WP_USERNAME_HARDCODED,
+      WP_APP_PASSWORD: WP_APP_PASSWORD_HARDCODED
+    };
+  }
+}
+
+
+/**
+ * Main function to process pending blog posts.
+ */
+function processPendingBlogPosts() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    Logger.log(`Error: Sheet "${SHEET_NAME}" not found.`);
+    SpreadsheetApp.getUi().alert(`Error: Sheet "${SHEET_NAME}" not found.`);
+    return;
+  }
+
+  const dataRange = sheet.getDataRange();
+  const values = dataRange.getValues();
+  const config = getConfig();
+
+  Logger.log(`Starting blog post processing. Found ${values.length - HEADER_ROWS} potential posts.`);
+
+  for (let i = HEADER_ROWS; i < values.length; i++) {
+    const row = values[i];
+    const currentStatus = row[STATUS_COL - 1];
+    const topic = row[TOPIC_COL - 1];
+    const categoryName = row[CATEGORY_COL - 1];
+
+    if ((currentStatus === '' || currentStatus === STATUS_PENDING) && topic) {
+      Logger.log(`Processing row ${i + 1}: Topic: "${topic}"`);
+      const currentRange = sheet.getRange(i + 1, 1, 1, sheet.getLastColumn());
+
+      try {
+        const blogContent = generateBlogPostContent(topic, config.GEMINI_API_KEY);
+        if (!blogContent) {
+          Logger.log(`Failed to generate content for "${topic}". Skipping.`);
+          currentRange.getCell(1, STATUS_COL).setValue(STATUS_ERROR_GEMINI);
+          continue;
+        }
+        Logger.log(`Successfully generated content for "${topic}"`);
+
+        const categoryId = findWPCategoryId(categoryName, config);
+        if (categoryId === null) {
+           Logger.log(`Could not find WordPress Category ID for "${categoryName}". Posting without category.`);
+        } else {
+           Logger.log(`Found Category ID ${categoryId} for "${categoryName}".`);
+        }
+
+        const postResult = postToWordPress(topic, blogContent, categoryId, config);
+
+        if (postResult && postResult.link) {
+          Logger.log(`Successfully posted "${topic}" to WordPress. URL: ${postResult.link}`);
+          currentRange.getCell(1, STATUS_COL).setValue(STATUS_POSTED);
+          currentRange.getCell(1, POST_URL_COL).setValue(postResult.link);
+        } else {
+          Logger.log(`Failed to post "${topic}" to WordPress.`);
+          currentRange.getCell(1, STATUS_COL).setValue(STATUS_ERROR_WP_POST);
+          if(postResult && postResult.errorMessage) {
+             currentRange.getCell(1, POST_URL_COL).setValue(postResult.errorMessage);
+          }
+        }
+
+      } catch (error) {
+        Logger.log(`An unexpected error occurred for row ${i + 1}: ${error} \n Stack: ${error.stack}`);
+         try {
+           currentRange.getCell(1, STATUS_COL).setValue(`Error: ${error.message}`);
+         } catch (e) {
+            Logger.log(`Could not even update the sheet status for row ${i+1} after error: ${e}`);
+         }
+      }
+
+      break; // Exit loop after processing the first pending row found
+
+      Utilities.sleep(2000); // Small delay
+    }
+  }
+  Logger.log('Finished processing blog posts.');
+}
+
+/**
+ * Generates blog post content using the Gemini API.
+ * @param {string} topic The topic.
+ * @param {string} apiKey The Gemini API Key.
+ * @return {string|null} The generated content (HTML) or null on failure.
+ */
+function generateBlogPostContent(topic, apiKey) {
+const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+  const prompt = `Generate a high-quality, authoritative, and SEO-optimized blog post on the topic: "${topic}".
+
+**Primary Goal:** Attract and engage potential clients for a Mumbai-based Digital Marketing Agency by demonstrating expertise and offering valuable insights relevant to their business needs.
+
+**Target Audience:** Business owners, marketing managers, and decision-makers in Mumbai.
+
+**Content Requirements:**
+
+1.  **Length:** Aim for **5000-5500 words**. Focus on depth, clarity, and actionable value rather than excessive length. Make paragraph little longers.
+2.  **Tone & Style:** Write in a professional, knowledgeable, yet approachable and human-like tone. Sound like an expert from a leading Mumbai Digital Marketing Agency sharing practical advice.
+3.  **Mumbai Context & Relevance:**
+    *   **Mandatory:** Integrate specific references, examples, challenges, or opportunities relevant to the **Mumbai market** throughout the post. How does ${topic} apply *specifically* to businesses operating in Mumbai?
+    *   Use local context where appropriate (e.g., referencing specific industries prominent in Mumbai, local market dynamics, common challenges faced by Mumbai businesses).
+4.  **Agency Perspective & Expertise (E-E-A-T):**
+    *   Write from the perspective of an experienced digital marketing agency.
+    *   Include unique insights, actionable tips, or common pitfalls observed when working with clients (can be generalized/anonymized). Demonstrate *your* agency's expertise on ${topic}.
+    *   Avoid overly generic statements; offer a distinct point of view where possible.
+5.  **Research & Value:** Base the content on solid principles and current best practices related to ${topic}. Provide genuine value and actionable takeaways for the reader.
+6.  **SEO Optimization:**
+    *   Naturally integrate relevant keywords (including variations and long-tail keywords) related to ${topic} and "digital marketing Mumbai".
+    *   Use clear, descriptive, keyword-informed headings (H2, H3, etc.) to structure the content logically.
+    *   Employ semantic variations of keywords.
+7.  **Readability:**
+    *   Use relatively short paragraphs (ideal for online reading).
+    *   Utilize bullet points, numbered lists, and bold text to break up content and improve skimmability.
+    *   Ensure a smooth, logical flow from introduction to conclusion.
+8.  **Formatting:**
+    *   Output *only* the blog post content in clean, valid HTML format suitable for web publishing.
+    *   **Start directly with the primary heading (<h1>) or the first paragraph. Do not include any leading text like "Here is the post:" or unnecessary whitespace/empty lines before the actual content begins.**
+    *   Use standard HTML tags (<h1>, <h2>, <h3>, <p>, <ul>, <ol>, <li>, <strong>, etc.).
+
+    Avoid writing things like [Your Address in Mumbai, if applicable, or mention ‘Serving clients across Mumbai’],  [Your Email Address], [Your Phone Number], [Your Digital Marketing Agency Name], etc.
+**Topic to write about:** ${topic}`;
+
+
+  const payload = {
+    contents: [{
+      parts: [{
+        text: prompt
+      }]
+    }],
+     generationConfig: {
+       maxOutputTokens: 9046,
+     }
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(geminiUrl, options);
+    const responseCode = response.getResponseCode();
+    const responseBody = response.getContentText();
+
+    if (responseCode === 200) {
+      const jsonResponse = JSON.parse(responseBody);
+      if (jsonResponse.candidates && jsonResponse.candidates.length > 0 &&
+          jsonResponse.candidates[0].content && jsonResponse.candidates[0].content.parts &&
+          jsonResponse.candidates[0].content.parts.length > 0) {
+         let combinedText = jsonResponse.candidates[0].content.parts.map(part => part.text).join('');
+         combinedText = combinedText.replace(/^```html\s*/i, '').replace(/\s*```$/, '');
+         return combinedText.trim();
+      } else if (jsonResponse.promptFeedback && jsonResponse.promptFeedback.blockReason) {
+         Logger.log(`Gemini content generation blocked. Reason: ${jsonResponse.promptFeedback.blockReason}`);
+         return null;
+      }
+       else {
+        Logger.log(`Gemini API response structure unexpected. Response: ${responseBody}`);
+        return null;
+      }
+    } else {
+      Logger.log(`Gemini API request failed. Response Code: ${responseCode}. Response Body: ${responseBody}`);
+      return null;
+    }
+  } catch (error) {
+    Logger.log(`Error calling Gemini API: ${error}`);
+    return null;
+  }
+}
+
+
+/**
+ * Finds the WordPress Category ID.
+ * @param {string} categoryName The category name.
+ * @param {object} config Configuration.
+ * @return {number|null} The category ID or null.
+ */
+function findWPCategoryId(categoryName, config) {
+  if (!categoryName) return null;
+
+  const categoriesUrl = `${config.WP_URL}/categories?search=${encodeURIComponent(categoryName)}&per_page=5`;
+  const authHeader = 'Basic ' + Utilities.base64Encode(`${config.WP_USERNAME}:${config.WP_APP_PASSWORD}`);
+
+  const options = {
+    method: 'get',
+    headers: {
+      'Authorization': authHeader
+    },
+    muteHttpExceptions: true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(categoriesUrl, options);
+    const responseCode = response.getResponseCode();
+    const responseBody = response.getContentText();
+
+    if (responseCode === 200) {
+      const categories = JSON.parse(responseBody);
+      const foundCategory = categories.find(cat => cat.name.toLowerCase() === categoryName.toLowerCase());
+      if (foundCategory) {
+        return foundCategory.id;
+      } else {
+        Logger.log(`Category "${categoryName}" not found.`);
+        return null;
+      }
+    } else {
+      Logger.log(`Failed to fetch WordPress categories. Code: ${responseCode}. Response: ${responseBody}`);
+      return null;
+    }
+  } catch (error) {
+    Logger.log(`Error searching for WordPress category: ${error}`);
+    return null;
+  }
+}
+
+/**
+ * Posts content to WordPress.
+ * @param {string} title The post title.
+ * @param {string} content The post content (HTML).
+ * @param {number|null} categoryId The category ID (or null).
+ * @param {object} config Configuration.
+ * @return {object|null} Post link object, error object, or null.
+ */
+function postToWordPress(title, content, categoryId, config) {
+  const postUrl = `${config.WP_URL}/posts`;
+  const authHeader = 'Basic ' + Utilities.base64Encode(`${config.WP_USERNAME}:${config.WP_APP_PASSWORD}`);
+
+  const postData = {
+    title: title,
+    content: content,
+    status: 'publish',
+  };
+
+  if (categoryId !== null && typeof categoryId === 'number') {
+    postData.categories = [categoryId];
+  }
+
+  const options = {
+    method: 'post',
+    headers: {
+      'Authorization': authHeader,
+    },
+    contentType: 'application/json',
+    payload: JSON.stringify(postData),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(postUrl, options);
+    const responseCode = response.getResponseCode();
+    const responseBody = response.getContentText();
+
+    if (responseCode === 201) {
+      const jsonResponse = JSON.parse(responseBody);
+      Logger.log(`Post created successfully. ID: ${jsonResponse.id}`);
+      return { link: jsonResponse.link };
+    } else {
+      let errorMessage = `WP API Error: Code ${responseCode}`;
+      try {
+        const errorResponse = JSON.parse(responseBody);
+        if (errorResponse.message) {
+           errorMessage += ` - ${errorResponse.message}`;
+        } else {
+           errorMessage += ` - Response: ${responseBody}`;
+        }
+      } catch (e) {
+        errorMessage += ` - Raw Response: ${responseBody}`;
+      }
+       Logger.log(errorMessage);
+      return { errorMessage: errorMessage };
+    }
+  } catch (error) {
+    Logger.log(`Error posting to WordPress: ${error}`);
+    return { errorMessage: `Error posting to WordPress: ${error.message}` };
+  }
+}
