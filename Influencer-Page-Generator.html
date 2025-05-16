@@ -1,64 +1,64 @@
-/**
- * Google Apps Script to automate blog post creation in WordPress using Gemini API.
- *
- * Instructions for Implementation:
- *
- * 1.  **Open Google Apps Script:**
- *     - Go to script.google.com or open your Google Sheet, go to Extensions > Apps Script.
- *
- * 2.  **Paste the Code:**
- *     - Replace any existing code in the script editor with the code provided below.
- *
- * 3.  **Configure Credentials (IMPORTANT - Use Script Properties for Security):**
- *     - **Strongly Recommended:** Store your sensitive credentials securely using Script Properties.
- *       - Go to `File > Project properties > Script properties`.
- *       - Click `Add row`.
- *       - Add the following properties and their corresponding values:
- *         - `WORDPRESS_URL`: Your WordPress site's REST API base URL (e.g., `https://yourwebsite.com/wp-json`). Note: This script appends `/wp/v2` or `/wp/v2/media` etc.
- *         - `WORDPRESS_USER`: Your WordPress username (usually email).
- *         - `WORDPRESS_APP_PASSWORD`: Your WordPress Application Password (NOT your regular password). Generate this in your WordPress dashboard under Users > Your Profile > Application Passwords.
- *         - `GEMINI_API_KEY`: Your Google Gemini API Key.
- *       - Click `Save script properties`.
- *     - **This script is configured to ONLY use Script Properties.** Hardcoding is not supported in this version for security reasons.
- *
- * 4.  **Configure Script Constants:**
- *     - Update `POST_TYPE_TO_CREATE` if your CPT slug is different from 'influencers'.
- *     - Update `POST_STATUS` if you want posts to be 'draft' or 'pending' instead of 'publish'.
- *     - Update `GEMINI_MODEL` if you want to use a different Gemini model (ensure it's compatible and available).
- *     - Update `PLACEHOLDER_PROFILE_PIC` if you have a different default image URL.
- *     - Adjust `UPLOAD_DELAY_MS` if needed to avoid hitting server limits during uploads.
- *
- * 5.  **Configure Form Question Titles (CRITICAL):**
- *     - **Update ALL `FORM_QUESTION_...` constants** to EXACTLY match the question titles in your Google Form. Case and spelling must be perfect.
- *     - Ensure your form includes questions for all the constants defined, especially the file upload questions (`FORM_QUESTION_PROFILE_PIC`, `FORM_QUESTION_GALLERY_IMAGES`, `FORM_QUESTION_VIDEO_UPLOAD_1`, `FORM_QUESTION_VIDEO_UPLOAD_2`) and their corresponding link questions (`FORM_QUESTION_VIDEO_LINK_1`, `FORM_QUESTION_VIDEO_LINK_2`).
- *
- * 6.  **Bind the Script to Your Google Form:**
- *     - Open the Google Form you want to use.
- *     - Go to the three-dot menu in the top right (`More`).
- *     - Select `Script editor`. This will create a new script project bound to this form.
- *     - Paste the code into this new script project, replacing any default code.
- *
- * 7.  **Set up the Form Submit Trigger:**
- *     - In the Apps Script editor (for the script bound to your form), select the `createFormSubmitTrigger` function from the dropdown menu next to the Run button.
- *     - Click the `Run` button (play icon).
- *     - You will be asked to authorize the script. Review the permissions (it needs access to the Form, Drive, external services) and authorize.
- *     - This function creates a trigger that automatically runs `onFormSubmit` whenever the form receives a new response.
- *     - You can verify the trigger exists by clicking the clock icon (`Triggers`) on the left sidebar.
- *     - If you need to remove the trigger later, run the `deleteTriggers` function.
- *
- * 8.  **Test the Form Submission:**
- *     - Submit a test response through your Google Form.
- *     - Check the `Executions` tab (list icon on the left sidebar) in the Apps Script editor to see if the `onFormSubmit` function ran successfully.
- *     - Check the `Logger` output (`View > Logs`) for detailed information, including any errors during uploads or API calls.
- *     - Check your WordPress site for the new CPT post.
- *
- * 9.  **Troubleshooting:**
- *     - **Missing Script Properties:** Ensure all required properties (`WORDPRESS_URL`, `WORDPRESS_USER`, `WORDPRESS_APP_PASSWORD`, `GEMINI_API_KEY`) are set correctly in `File > Project properties > Script properties`.
- *     - **Incorrect Form Question Titles:** Double-check that the `FORM_QUESTION_...` constants in the script exactly match your form's question titles.
- *     - **WordPress API Errors:** Check the Logger output for specific error codes and messages from WordPress (e.g., 401, 403, 404, rest_cannot_create). This often indicates incorrect credentials, insufficient user permissions, or an incorrect WP URL/CPT slug.
- *     - **Gemini API Errors:** Check the Logger output for errors from the Gemini API (e.g., 429 for rate limits, 400 for bad requests, content blocked).
- *     - **File Upload Issues:** Ensure the script has permission to access Google Drive files uploaded via the form. Check WordPress media settings for file size limits or allowed file types.
- *     - **Incomplete HTML:** If the generated HTML is cut off, check the Gemini API logs for `MAX_TOKENS` or `SAFETY` finish reasons. Adjust the prompt or `maxOutputTokens` if necessary, or review safety settings.
+/*
+  Google Apps Script to automate blog post creation in WordPress using Gemini API.
+ 
+  Instructions for Implementation:
+ 
+  1.  **Open Google Apps Script:**
+      - Go to script.google.com or open your Google Sheet, go to Extensions > Apps Script.
+ 
+  2.  **Paste the Code:**
+      - Replace any existing code in the script editor with the code provided below.
+ 
+  3.  **Configure Credentials (IMPORTANT - Use Script Properties for Security):**
+      - **Strongly Recommended:** Store your sensitive credentials securely using Script Properties.
+        - Go to `File > Project properties > Script properties`.
+        - Click `Add row`.
+        - Add the following properties and their corresponding values:
+          - `WORDPRESS_URL`: Your WordPress site's REST API base URL (e.g., `https://yourwebsite.com/wp-json`). Note: This script appends `/wp/v2` or `/wp/v2/media` etc.
+          - `WORDPRESS_USER`: Your WordPress username (usually email).
+          - `WORDPRESS_APP_PASSWORD`: Your WordPress Application Password (NOT your regular password). Generate this in your WordPress dashboard under Users > Your Profile > Application Passwords.
+          - `GEMINI_API_KEY`: Your Google Gemini API Key.
+        - Click `Save script properties`.
+      - **This script is configured to ONLY use Script Properties.** Hardcoding is not supported in this version for security reasons.
+ 
+  4.  **Configure Script Constants:**
+      - Update `POST_TYPE_TO_CREATE` if your CPT slug is different from 'influencers'.
+      - Update `POST_STATUS` if you want posts to be 'draft' or 'pending' instead of 'publish'.
+      - Update `GEMINI_MODEL` if you want to use a different Gemini model (ensure it's compatible and available).
+      - Update `PLACEHOLDER_PROFILE_PIC` if you have a different default image URL.
+      - Adjust `UPLOAD_DELAY_MS` if needed to avoid hitting server limits during uploads.
+ 
+  5.  **Configure Form Question Titles (CRITICAL):**
+      - **Update ALL `FORM_QUESTION_...` constants** to EXACTLY match the question titles in your Google Form. Case and spelling must be perfect.
+      - Ensure your form includes questions for all the constants defined, especially the file upload questions (`FORM_QUESTION_PROFILE_PIC`, `FORM_QUESTION_GALLERY_IMAGES`, `FORM_QUESTION_VIDEO_UPLOAD_1`, `FORM_QUESTION_VIDEO_UPLOAD_2`) and their corresponding link questions (`FORM_QUESTION_VIDEO_LINK_1`, `FORM_QUESTION_VIDEO_LINK_2`).
+ 
+  6.  **Bind the Script to Your Google Form:**
+      - Open the Google Form you want to use.
+      - Go to the three-dot menu in the top right (`More`).
+      - Select `Script editor`. This will create a new script project bound to this form.
+      - Paste the code into this new script project, replacing any default code.
+ 
+  7.  **Set up the Form Submit Trigger:**
+      - In the Apps Script editor (for the script bound to your form), select the `createFormSubmitTrigger` function from the dropdown menu next to the Run button.
+      - Click the `Run` button (play icon).
+      - You will be asked to authorize the script. Review the permissions (it needs access to the Form, Drive, external services) and authorize.
+      - This function creates a trigger that automatically runs `onFormSubmit` whenever the form receives a new response.
+      - You can verify the trigger exists by clicking the clock icon (`Triggers`) on the left sidebar.
+      - If you need to remove the trigger later, run the `deleteTriggers` function.
+ 
+  8.  **Test the Form Submission:**
+      - Submit a test response through your Google Form.
+      - Check the `Executions` tab (list icon on the left sidebar) in the Apps Script editor to see if the `onFormSubmit` function ran successfully.
+      - Check the `Logger` output (`View > Logs`) for detailed information, including any errors during uploads or API calls.
+      - Check your WordPress site for the new CPT post.
+ 
+  9.  **Troubleshooting:**
+      - **Missing Script Properties:** Ensure all required properties (`WORDPRESS_URL`, `WORDPRESS_USER`, `WORDPRESS_APP_PASSWORD`, `GEMINI_API_KEY`) are set correctly in `File > Project properties > Script properties`.
+      - **Incorrect Form Question Titles:** Double-check that the `FORM_QUESTION_...` constants in the script exactly match your form's question titles.
+      - **WordPress API Errors:** Check the Logger output for specific error codes and messages from WordPress (e.g., 401, 403, 404, rest_cannot_create). This often indicates incorrect credentials, insufficient user permissions, or an incorrect WP URL/CPT slug.
+      - **Gemini API Errors:** Check the Logger output for errors from the Gemini API (e.g., 429 for rate limits, 400 for bad requests, content blocked).
+      - **File Upload Issues:** Ensure the script has permission to access Google Drive files uploaded via the form. Check WordPress media settings for file size limits or allowed file types.
+      - **Incomplete HTML:** If the generated HTML is cut off, check the Gemini API logs for `MAX_TOKENS` or `SAFETY` finish reasons. Adjust the prompt or `maxOutputTokens` if necessary, or review safety settings.
  */
 
 // ========================================================================
