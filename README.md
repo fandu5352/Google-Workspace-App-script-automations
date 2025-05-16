@@ -31,28 +31,6 @@ This repository contains multiple Google Apps Script projects designed to automa
 ## License
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.
 
----
-
-## Project Structure
-```
-/app-script-automations/
-├── auto-blog-generator/
-│   ├── main.gs
-│   ├── README.md
-│   └── example-sheets/
-├── news-auto-generator/
-│   ├── main.gs
-│   ├── README.md
-│   └── example-sheets/
-├── landing-page-generator/
-│   ├── main.gs
-│   ├── README.md
-│   └── example-sheets/
-├── sheet-form-gmail-integrator/
-│   ├── main.gs
-│   ├── README.md
-│   └── example-sheets/
-└── LICENSE
 ```
 
 ## Contact
