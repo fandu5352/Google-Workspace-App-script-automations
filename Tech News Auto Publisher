@@ -1,0 +1,662 @@
+/** ============================================================
+ *  CONFIGURATION AREA
+ *  ============================================================
+ *  --> IMPORTANT: Use Script Properties for Security! <--
+ *  Go to Project Settings > Script Properties to store sensitive data like API Keys and Passwords.
+ *  The default values below are placeholders or for initial testing ONLY.
+ * ============================================================
+ */
+const SCRIPT_PROPS = PropertiesService.getScriptProperties();
+
+// --- Essential Settings ---
+const SHEET_ID                  = SCRIPT_PROPS.getProperty('SHEET_ID'); // Extracted Sheet ID from your URL
+const SHEET_NAME                = SCRIPT_PROPS.getProperty('SHEET_NAME');      // Exact name of the tab in your Google Sheet
+const MAX_ITEMS_TO_ADD_PER_RUN  = 1; // Limit adding rows to the sheet to only ONE per run
+const MAX_ITEMS_TO_PROCESS      = 1; // Process only ONE 'New' item from the sheet per run
+
+// --- WordPress Settings ---
+const WP_URL                    = SCRIPT_PROPS.getProperty('WP_URL'); // Your WordPress site URL
+const WP_USERNAME               = SCRIPT_PROPS.getProperty('WP_USERNAME'); // WP Username
+const WP_APP_PASSWORD           = SCRIPT_PROPS.getProperty('WP_APP_PASSWORD'); // WP Application Password (spaces matter!)
+const WP_CATEGORY               = SCRIPT_PROPS.getProperty('WP_CATEGORY');     // Default category for posts (MUST exist in WP)
+
+// --- Google AI Gemini Settings ---
+const GEMINI_API_KEY            = SCRIPT_PROPS.getProperty('GEMINI_API_KEY'); // Your Gemini API Key
+const GEMINI_MODEL              = 'gemini-1.5-flash-latest';
+const GEMINI_API_ENDPOINT       = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
+// --- News Sources (RSS Preferred) ---
+// Verify these URLs point to valid RSS/Atom feeds
+const RSS_FEEDS = [
+  'https://economictimes.indiatimes.com/rssfeeds/13357270.cms', // ET Tech
+  'https://www.hindustantimes.com/feeds/rss/technology/rssfeed.xml', // HT Tech
+  'https://www.businesstimes.com.sg/technology/rss' // Business Times Tech (Monitor for XML errors)
+];
+
+// --- (Optional) Google Custom Search Settings (Fallback) ---
+const USE_CUSTOM_SEARCH         = false; // Set to true ONLY to use Search API if RSS fails
+const SEARCH_API_KEY            = SCRIPT_PROPS.getProperty('SEARCH_API_KEY'); // Your Custom Search API Key
+const SEARCH_CX_ID              = SCRIPT_PROPS.getProperty('SEARCH_CX_ID'); // Your Custom Search Engine ID
+const SEARCH_QUERY              = 'site:economictimes.indiatimes.com/tech OR site:hindustantimes.com/technology OR site:businesstimes.com.sg/technology'; // Target sites
+const MAX_SEARCH_RESULTS        = 10; // Limit search results if used
+
+// --- Column Mapping ---
+// Ensure your Sheet matches this structure
+const COLS = {
+  URL: 1,         // A
+  ORIG_TITLE: 2,  // B
+  CONTENT: 3,     // C
+  CATEGORY: 4,    // D
+  STATUS: 5,      // E
+  TIMESTAMP: 6,   // F
+  WP_POST_ID: 7,  // G
+  ERROR_MSG: 8    // H
+};
+const HEADER_ROW = ['Original URL', 'Original Title', 'Generated Content', 'Category', 'Status', 'Timestamp', 'WordPress Post ID', 'Error Message'];
+// ============================================================
+// END OF CONFIGURATION AREA
+// ============================================================
+
+
+/**
+ * MAIN FUNCTION - Orchestrates the process.
+ * Setup a time-driven trigger to run this function periodically.
+ */
+function mainNewsAutomation() {
+  Logger.log(`--- Starting News Automation Cycle [${new Date().toISOString()}] ---`);
+  let ss = null;
+  let sheet = null;
+
+  try {
+    try {
+      ss = SpreadsheetApp.openById(SHEET_ID);
+      sheet = ss.getSheetByName(SHEET_NAME);
+      if (!sheet) {
+        throw new Error(`Sheet tab named "${SHEET_NAME}" not found in Spreadsheet ID ${SHEET_ID}.`);
+      }
+      Logger.log(`Successfully opened Sheet: "${ss.getName()}" -> Tab: "${sheet.getName()}"`);
+    } catch (e) {
+      Logger.log(`FATAL ERROR: Could not open Spreadsheet/Sheet. Check SHEET_ID ("${SHEET_ID}") and SHEET_NAME ("${SHEET_NAME}"). Error: ${e.message}`);
+      return;
+    }
+
+    const fetchedItems = fetchLatestNews();
+    if (!fetchedItems || fetchedItems.length === 0) {
+      Logger.log('No new news items fetched from any source.');
+    } else {
+      Logger.log(`Fetched ${fetchedItems.length} potential new items.`);
+    }
+
+    const addedCount = addNewsToSheet(sheet, fetchedItems);
+    if (addedCount > 0) {
+        Logger.log(`Added ${addedCount} new unique item(s) to the sheet (limit was ${MAX_ITEMS_TO_ADD_PER_RUN}).`);
+    } else if (fetchedItems && fetchedItems.length > 0) {
+        Logger.log('Fetched items were likely already present in the sheet, or none were unique.');
+    }
+
+    processFirstNewItemFromSheet(sheet);
+
+    Logger.log(`--- News Automation Cycle Completed [${new Date().toISOString()}] ---`);
+
+  } catch (error) {
+    Logger.log(`FATAL ERROR in mainNewsAutomation: ${error.message}\nStack: ${error.stack}`);
+  }
+}
+
+// ==================================================================
+// STEP 1: Fetch News (Prioritizes RSS)
+// ==================================================================
+function fetchLatestNews() {
+  let newsItems = [];
+  Logger.log('Attempting to fetch news from RSS feeds...');
+  const fetchOptions = { muteHttpExceptions: true, validateHttpsCertificates: true, followRedirects: true };
+
+  RSS_FEEDS.forEach(feedUrl => {
+    let response = null;
+    let responseCode = -1;
+    let rssContent = '';
+    try {
+      Logger.log(`Fetching RSS: ${feedUrl}`);
+      response = UrlFetchApp.fetch(feedUrl, fetchOptions);
+      responseCode = response.getResponseCode();
+      rssContent = response.getContentText();
+
+      if (responseCode >= 200 && responseCode < 300 && rssContent) {
+        const document = XmlService.parse(rssContent);
+        const root = document.getRootElement();
+        const atomNs = XmlService.getNamespace('http://www.w3.org/2005/Atom');
+
+        let entries = [];
+        const channel = root.getChild('channel');
+        if (channel) {
+            entries = channel.getChildren('item');
+        }
+        if (entries.length === 0) {
+            if (root.getName() === 'feed') {
+                entries = root.getChildren('entry');
+                if (entries.length === 0) entries = root.getChildren('entry', atomNs);
+            } else {
+                Logger.log(`Warning: Unexpected root element <${root.getName()}> in feed: ${feedUrl}.`);
+            }
+        }
+
+        if (entries.length === 0) {
+             Logger.log(`Warning: No <item> or <entry> elements found in feed: ${feedUrl}`);
+             return;
+        }
+
+        let count = 0;
+        entries.forEach(item => {
+          let title = '', link = '', guid = '';
+          try {
+            title = item.getChildText('title');
+            if (!title && item.getChild('title', atomNs)) title = item.getChild('title', atomNs).getText();
+
+            link = item.getChildText('link');
+            if (!link && item.getChild('link', atomNs)) link = item.getChild('link', atomNs).getAttribute('href')?.getValue();
+            guid = item.getChildText('guid');
+
+            if (!link || !link.trim().startsWith('http')) {
+                if (guid && guid.trim().startsWith('http') && !guid.trim().includes(" ")) {
+                    link = guid.trim();
+                } else { link = null; }
+            } else { link = link.trim(); }
+            title = title ? title.trim() : null;
+
+            if (title && link) {
+               newsItems.push({ title: title, link: link });
+               count++;
+            }
+          } catch (parseError) {
+             Logger.log(`Error parsing individual item in feed ${feedUrl}: ${parseError.message}.`);
+          }
+        });
+        Logger.log(`Parsed ${count} items from ${feedUrl}`);
+      } else if (responseCode === 404) {
+           Logger.log(`Feed ${feedUrl} not found (404).`);
+      } else {
+        Logger.log(`Failed to fetch RSS feed ${feedUrl}. Status: ${responseCode}. Response snippet: ${rssContent.substring(0, 200)}`);
+      }
+    } catch (error) {
+      let errorMsg = `Error fetching/parsing feed ${feedUrl}: ${error.message}`;
+      if (feedUrl.includes('businesstimes.com') && error.message.includes("markup")) {
+          errorMsg += `. Known issue with leading characters in Business Times feed.`;
+      } else if (error.message.includes("timeout")) {
+          errorMsg += `. Request likely timed out.`;
+      }
+      Logger.log(errorMsg);
+    }
+  });
+
+  if (newsItems.length === 0 && USE_CUSTOM_SEARCH) {
+    Logger.log('RSS fetch yielded no results. Attempting fallback to Google Custom Search API...');
+    try {
+      if (!SEARCH_API_KEY || !SEARCH_CX_ID || SEARCH_API_KEY.startsWith('YOUR_') || SEARCH_CX_ID.startsWith('YOUR_')) {
+          Logger.log('Skipping Custom Search: API Key or CX ID missing/invalid.');
+          return [];
+      }
+      const searchUrl = `https://www.googleapis.com/customsearch/v1?key=${SEARCH_API_KEY}&cx=${SEARCH_CX_ID}&q=${encodeURIComponent(SEARCH_QUERY)}&num=${MAX_SEARCH_RESULTS}&sort=date`;
+      const searchResponse = UrlFetchApp.fetch(searchUrl, { muteHttpExceptions: true });
+      const searchResponseCode = searchResponse.getResponseCode();
+      const searchResultText = searchResponse.getContentText();
+
+      if (searchResponseCode === 200) {
+        const searchResult = JSON.parse(searchResultText);
+        if (searchResult.items && searchResult.items.length > 0) {
+            let searchCount = 0;
+            searchResult.items.forEach(item => {
+              if (item.title && item.link && item.link.startsWith('http')) {
+                newsItems.push({ title: item.title.trim(), link: item.link.trim() });
+                searchCount++;
+              }
+            });
+            Logger.log(`Fetched ${searchCount} items via Custom Search API.`);
+        } else { Logger.log('Custom Search API returned success (200) but no items found.'); }
+      } else { Logger.log(`Error fetching from Custom Search API. Status: ${searchResponseCode}. Response: ${searchResultText.substring(0, 500)}`); }
+    } catch (error) { Logger.log(`Error during Custom Search API call: ${error.message}`); }
+  } else if (USE_CUSTOM_SEARCH) { Logger.log('Skipping Custom Search fallback as RSS feeds provided results.'); }
+
+  const uniqueItems = [];
+  const seenLinks = new Set();
+  newsItems.forEach(item => {
+      if (item.link && !seenLinks.has(item.link)) {
+          uniqueItems.push(item);
+          seenLinks.add(item.link);
+      }
+  });
+  Logger.log(`Returning ${uniqueItems.length} unique news items after deduplication.`);
+  return uniqueItems;
+}
+
+// ==================================================================
+// STEP 2: Add *AT MOST ONE* New Item to Sheet, Check Duplicates
+// ==================================================================
+function addNewsToSheet(sheet, newsItems) {
+  if (!newsItems || newsItems.length === 0) return 0;
+  let addedCount = 0;
+  try {
+    let existingUrls = new Set();
+    if (sheet.getLastRow() > 1) {
+       const urls = sheet.getRange(2, COLS.URL, sheet.getLastRow() - 1, 1)
+                        .getValues()
+                        .flat()
+                        .filter(url => typeof url === 'string' && url.trim().startsWith('http'));
+       existingUrls = new Set(urls);
+    } else { Logger.log("Sheet has no data rows yet."); }
+
+    Logger.log(`Found ${existingUrls.size} existing valid URLs. Checking ${newsItems.length} fetched items.`);
+    const rowsToAdd = [];
+
+    for (const item of newsItems) {
+      if (item.link && typeof item.link === 'string' && item.link.startsWith('http') &&
+          item.title && typeof item.title === 'string' && item.title.trim() !== '') {
+
+          if (!existingUrls.has(item.link)) {
+            rowsToAdd.push([
+              item.link,
+              item.title,
+              '',
+              WP_CATEGORY,
+              'New',
+              new Date(),
+              '',
+              ''
+            ]);
+            existingUrls.add(item.link);
+            addedCount++;
+
+            if (addedCount >= MAX_ITEMS_TO_ADD_PER_RUN) {
+                Logger.log(`Reached limit of ${MAX_ITEMS_TO_ADD_PER_RUN} item(s) to add.`);
+                break;
+            }
+          }
+      }
+    }
+
+    if (rowsToAdd.length > 0) {
+      if (sheet.getLastRow() === 0) {
+          Logger.log("Sheet is empty. Adding header row.");
+          sheet.appendRow(HEADER_ROW);
+      } else if (sheet.getLastRow() === 1) {
+          const currentHeader = sheet.getRange(1, 1, 1, HEADER_ROW.length).getValues()[0];
+          if (JSON.stringify(currentHeader) !== JSON.stringify(HEADER_ROW)) {
+              Logger.log("Header row mismatch. Updating header.");
+              sheet.getRange(1, 1, 1, HEADER_ROW.length).setValues([HEADER_ROW]);
+          }
+      }
+
+      sheet.getRange(sheet.getLastRow() + 1, 1, rowsToAdd.length, COLS.ERROR_MSG).setValues(rowsToAdd);
+      SpreadsheetApp.flush();
+      Logger.log(`Appended ${rowsToAdd.length} new row(s).`);
+    } else {
+      Logger.log('No new unique items found to add.');
+    }
+    return addedCount;
+  } catch (error) {
+    Logger.log(`Error in addNewsToSheet: ${error.message}\n${error.stack}`);
+    return 0;
+  }
+}
+
+// ==================================================================
+// STEP 4, 5, 6, 7: Process ONLY THE FIRST 'New' Item Found
+// ==================================================================
+function processFirstNewItemFromSheet(sheet) {
+  let processedAttempted = false;
+  Logger.log(`Searching for the first 'New' item to process (max ${MAX_ITEMS_TO_PROCESS} item)...`);
+
+  try {
+    if (sheet.getLastRow() < 2) {
+        Logger.log("Sheet has no data rows to process.");
+        return;
+    }
+    const dataRange = sheet.getRange(2, 1, sheet.getLastRow() - 1, COLS.STATUS);
+    const values = dataRange.getValues();
+
+    for (let i = 0; i < values.length; i++) {
+      const row = values[i];
+      const status = row[COLS.STATUS - 1];
+      const rowNum = i + 2;
+
+      if (status === 'New' && !processedAttempted) {
+        processedAttempted = true;
+        Logger.log(`Found 'New' item at row ${rowNum}. Attempting processing...`);
+
+        const originalUrl = row[COLS.URL - 1];
+        const originalTitle = row[COLS.ORIG_TITLE - 1];
+        const category = row[COLS.CATEGORY - 1];
+
+        if (!originalUrl || typeof originalUrl !== 'string' || !originalUrl.startsWith('http')) {
+            updateSheetStatus(sheet, rowNum, 'Error', null, 'Invalid or missing URL in sheet row.');
+            Logger.log(`Row ${rowNum}: Skipped due to invalid URL.`);
+            break;
+        }
+         if (!originalTitle || typeof originalTitle !== 'string' || originalTitle.trim() === '') {
+            updateSheetStatus(sheet, rowNum, 'Error', null, 'Invalid or missing Original Title in sheet row.');
+            Logger.log(`Row ${rowNum}: Skipped due to invalid Original Title.`);
+            break;
+        }
+         if (!category || typeof category !== 'string' || category.trim() === '') {
+            updateSheetStatus(sheet, rowNum, 'Error', null, 'Invalid or missing Category in sheet row.');
+            Logger.log(`Row ${rowNum}: Skipped due to invalid Category.`);
+            break;
+        }
+
+        Logger.log(`Processing row ${rowNum}: "${originalTitle}"`);
+        updateSheetStatus(sheet, rowNum, 'Processing', null, '');
+
+        let generatedContent = null;
+        let postId = null;
+
+        try {
+          Logger.log(`Generating content for row ${rowNum} using ${GEMINI_MODEL}...`);
+          generatedContent = generateContentWithGemini(originalTitle, originalTitle, originalUrl);
+          if (!generatedContent || typeof generatedContent !== 'string' || generatedContent.length < 100) {
+              throw new Error(`Content generation failed or returned insufficient content (${generatedContent ? generatedContent.length : 'null/invalid'} chars).`);
+          }
+          sheet.getRange(rowNum, COLS.CONTENT).setValue(generatedContent);
+          SpreadsheetApp.flush();
+          Logger.log(`Row ${rowNum}: Content generated successfully (${generatedContent.length} chars).`);
+
+          Logger.log(`Posting row ${rowNum} ("${originalTitle}") to WordPress...`);
+          postId = postToWordPress(originalTitle, generatedContent, category);
+          if (!postId || typeof postId !== 'number' || postId <= 0) {
+             throw new Error(`Posting to WordPress failed or returned an invalid Post ID (Received: ${postId}).`);
+          }
+           Logger.log(`Row ${rowNum}: Successfully posted to WordPress. Post ID: ${postId}`);
+
+          updateSheetStatus(sheet, rowNum, 'Posted', postId, '');
+          Logger.log(`Row ${rowNum}: Successfully processed and posted.`);
+
+        } catch (processingError) {
+          Logger.log(`ERROR processing row ${rowNum}: ${processingError.message}`);
+          let errorToLog = processingError.message || 'Unknown processing error';
+          if (GEMINI_API_KEY && errorToLog.includes(GEMINI_API_KEY)) errorToLog = "Gemini API key related error occurred.";
+          if (WP_APP_PASSWORD && errorToLog.includes(WP_APP_PASSWORD)) errorToLog = "WordPress Authentication error occurred.";
+          updateSheetStatus(sheet, rowNum, 'Error', null, errorToLog.substring(0, 500));
+          Logger.log(`Row ${rowNum}: Processing failed. Status set to Error.`);
+        }
+
+        break;
+
+      }
+    }
+
+    if (!processedAttempted) {
+       Logger.log("No items with status 'New' were found to process.");
+    }
+
+  } catch (error) {
+    Logger.log(`Error in processFirstNewItemFromSheet: ${error.message}\n${error.stack}`);
+  }
+}
+
+
+// ==================================================================
+// STEP 5 Helper: Generate Content via Google AI Gemini API
+// ==================================================================
+function generateContentWithGemini(titleForPrompt, originalTitleContext, originalUrl) {
+  if (!GEMINI_API_KEY || GEMINI_API_KEY.startsWith('YOUR_') || GEMINI_API_KEY.length < 10) {
+     Logger.log('Skipping Gemini: Google AI API Key is missing or appears invalid.');
+     throw new Error('Google AI API Key not configured or invalid.');
+  }
+  const prompt = `Act as a tech news article writer and summarizer.
+You are given a news title and the original source URL for context.
+News Title: "${titleForPrompt}"
+Original Source URL: ${originalUrl}
+(For context, the original title was: "${originalTitleContext}")
+
+Please write a unique and informative news article based on this topic. Your article should be:
+1.  Approximately 1000-1500 characters long.
+2.  Accurate based on the context provided by the title and URL.
+3.  Engaging and well-structured for a tech news blog audience. Use paragraphs.
+4.  **Completely original**: Do NOT copy sentences or phrases from the source URL or other external websites. Re-interpret and rewrite the information in your own words.
+5.  Include an introduction, key details/developments, and a brief concluding thought.
+6.  Output ONLY the article text. No conversational filler, greetings, sign-offs, or markdown formatting like headings (#) or bold (**). Just plain text paragraphs.
+
+Generate the article now:`;
+
+  const payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.7, topK: 40, topP: 0.95 },
+    safetySettings: [
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" }
+    ]
+  };
+  const options = {
+      method: 'post', contentType: 'application/json', payload: JSON.stringify(payload),
+      muteHttpExceptions: true, headers: { 'User-Agent': 'AppsScript-News-Automation/1.1' }
+  };
+  const apiUrl = `${GEMINI_API_ENDPOINT}?key=${GEMINI_API_KEY}`;
+
+  Logger.log(`Calling Gemini API: ${GEMINI_API_ENDPOINT} (Key hidden)`);
+  let response, responseCode, responseBody;
+  try {
+    response = UrlFetchApp.fetch(apiUrl, options);
+    responseCode = response.getResponseCode();
+    responseBody = response.getContentText();
+
+    if (responseCode === 200) {
+        const data = JSON.parse(responseBody);
+        if (data.promptFeedback && data.promptFeedback.blockReason) {
+             const blockReason = data.promptFeedback.blockReason;
+             const safetyRatings = JSON.stringify(data.promptFeedback.safetyRatings || []);
+             Logger.log(`Gemini prompt blocked. Reason: ${blockReason}. Ratings: ${safetyRatings}`);
+             throw new Error(`Gemini prompt was blocked due to safety filters (${blockReason}).`);
+        }
+        if (data.candidates && data.candidates[0]) {
+             const candidate = data.candidates[0];
+             const finishReason = candidate.finishReason;
+             if (finishReason === 'SAFETY') {
+                 const safetyRatings = JSON.stringify(candidate.safetyRatings || []);
+                 Logger.log(`Gemini content generation blocked mid-way due to safety settings. Ratings: ${safetyRatings}`);
+                 throw new Error('Content generation blocked by safety filters during response generation.');
+             }
+             if (candidate.content && candidate.content.parts && candidate.content.parts[0] && candidate.content.parts[0].text) {
+                const generatedText = candidate.content.parts[0].text.trim();
+                if (finishReason && finishReason !== 'STOP') { Logger.log(`Gemini generation finished with reason: ${finishReason}.`); }
+                if (generatedText.length === 0 && finishReason === 'STOP') {
+                     Logger.log(`Gemini returned empty text despite finish reason STOP. Response: ${responseBody.substring(0, 500)}`);
+                     throw new Error('Gemini API returned empty content unexpectedly.');
+                }
+                if (generatedText.length < 800 || generatedText.length > 1800) { Logger.log(`Warning: Generated content length (${generatedText.length}) is outside target range (1000-1500 chars).`); }
+                return generatedText;
+            }
+        }
+        Logger.log(`Gemini response missing expected content structure. Response: ${responseBody.substring(0, 1000)}`);
+        throw new Error('Gemini API response format unexpected or content missing.');
+
+    } else {
+      let errorMessage = `Gemini API Error: Status Code ${responseCode}.`;
+      try {
+          const errorData = JSON.parse(responseBody);
+          if (errorData.error && errorData.error.message) {
+              errorMessage += ` Message: ${errorData.error.message}`;
+              if (errorData.error.message.includes("API key not valid")) { throw new Error(`Gemini API key is invalid. Check configuration. (Status ${responseCode})`); }
+              if (errorData.error.status === 'PERMISSION_DENIED') { throw new Error(`Gemini API permission denied. Ensure API is enabled/key correct. (Status ${responseCode})`); }
+              if (errorData.error.status === 'INVALID_ARGUMENT') { throw new Error(`Gemini API invalid argument. Check model name or payload. (Status ${responseCode})`); }
+          } else { errorMessage += ` Response: ${responseBody.substring(0, 500)}`; }
+      } catch (e) { errorMessage += ` Raw Response: ${responseBody.substring(0, 500)}`; }
+      Logger.log(errorMessage);
+      throw new Error(`Gemini API request failed with status ${responseCode}. Check logs.`);
+    }
+  } catch (error) {
+    Logger.log(`Exception during Google AI Gemini API call: ${error.message}`);
+    if (error.message && GEMINI_API_KEY && error.message.includes(GEMINI_API_KEY)) {
+       throw new Error("Error occurred during Gemini API call involving the API key.");
+    }
+    throw error;
+  }
+}
+
+// ==================================================================
+// STEP 6 Helper: Post to WordPress REST API
+// ==================================================================
+function postToWordPress(title, content, categoryName) {
+  if (!WP_URL || !WP_USERNAME || !WP_APP_PASSWORD || WP_URL.startsWith('https://yourwebsite.com') || WP_APP_PASSWORD.length < 10) {
+     Logger.log('Skipping WordPress Post: Credentials appear invalid or not configured.');
+     throw new Error('WordPress credentials invalid or not configured.');
+  }
+  const wpApiUrl = `${WP_URL.replace(/\/$/, "")}/wp-json/wp/v2/posts`;
+  let basicAuth;
+  try { basicAuth = Utilities.base64Encode(`${WP_USERNAME.trim()}:${WP_APP_PASSWORD.trim()}`); }
+  catch (e) { Logger.log(`Error encoding WP credentials: ${e.message}`); throw new Error("Failed to encode WP credentials."); }
+
+  const payload = { title: title, content: content, status: 'publish', comment_status: 'closed', ping_status: 'closed', categories: [] };
+
+  try {
+    Logger.log(`Looking up WordPress Category ID for: "${categoryName}"`);
+    const categoryId = getWordPressCategoryId(categoryName, basicAuth);
+    if (categoryId) { payload.categories = [categoryId]; Logger.log(`Found Category ID: ${categoryId}.`); }
+    else { Logger.log(`Warning: Category "${categoryName}" not found. Posting to default category.`); }
+  } catch (catError) { Logger.log(`Warning: Error during WP category lookup: ${catError.message}. Posting to default.`); }
+
+  const options = { method: 'post', contentType: 'application/json', headers: { 'Authorization': 'Basic ' + basicAuth, 'User-Agent': 'AppsScript-News-Automation/1.1' }, payload: JSON.stringify(payload), muteHttpExceptions: true };
+
+  Logger.log(`Posting to WP API: ${wpApiUrl} with Title: "${title.substring(0, 60)}..."`);
+  let response, responseCode, responseBody;
+  try {
+    response = UrlFetchApp.fetch(wpApiUrl, options);
+    responseCode = response.getResponseCode();
+    responseBody = response.getContentText();
+
+    if (responseCode === 201) {
+      const postData = JSON.parse(responseBody);
+      if (postData && postData.id && typeof postData.id === 'number' && postData.id > 0) {
+          Logger.log(`Successfully created WP post. ID: ${postData.id}, Link: ${postData.link}`);
+          return postData.id;
+      } else {
+          Logger.log(`WP returned 201 Created, but response body missing valid ID. Resp: ${responseBody.substring(0, 500)}`);
+          throw new Error("WP post created (201) but failed to parse Post ID from response.");
+      }
+    } else {
+       let errorMessage = `Error posting to WordPress: Status Code ${responseCode}. `;
+       try {
+           const errorData = JSON.parse(responseBody);
+           let wpMsg = errorData.message || JSON.stringify(errorData);
+            if (responseCode === 400) { errorMessage += `Bad Request. Invalid parameter? WP Msg: ${wpMsg}`; }
+            else if (responseCode === 401) { errorMessage += `Authentication Failed. Check WP User/App Password. WP Msg: ${wpMsg}`; }
+            else if (responseCode === 403) { errorMessage += `Forbidden. User permission issue? WP Msg: ${wpMsg}`; }
+            else if (responseCode === 404) { errorMessage += `Not Found. WP REST API endpoint (${wpApiUrl}) incorrect/disabled?`; }
+            else { errorMessage += `WP Message: ${wpMsg}`; }
+       } catch(e) { errorMessage += `Raw Response (non-JSON): ${responseBody.substring(0, 500)}`; }
+       Logger.log(errorMessage);
+       if (responseCode === 401 || responseCode === 403) { throw new Error(`WordPress auth/permission error (Status ${responseCode}).`); }
+       else { throw new Error(errorMessage); }
+    }
+  } catch (error) {
+     Logger.log(`Exception during WordPress API call: ${error.message}`);
+     if (error.message.includes("DNS") || error.message.includes("timed out") || error.message.includes("refused")) { throw new Error(`Network error connecting to WordPress URL (${WP_URL}).`); }
+     if (error.message && WP_APP_PASSWORD && error.message.includes(WP_APP_PASSWORD)) { throw new Error("Error during WP API call potentially involving credentials."); }
+    throw error;
+  }
+}
+
+// ==================================================================
+// Helper: Get WordPress Category ID by name (with caching)
+// ==================================================================
+function getWordPressCategoryId(categoryName, basicAuth) {
+  if (!categoryName || typeof categoryName !== 'string' || categoryName.trim() === '') { Logger.log("Cannot search for category ID: Name empty/invalid."); return null; }
+  const trimmedCategoryName = categoryName.trim();
+  const cache = CacheService.getScriptCache();
+  const cacheKey = `wp_cat_id_${WP_URL.replace(/[^a-zA-Z0-9]/g, '')}_${trimmedCategoryName.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+
+  const cachedId = cache.get(cacheKey);
+  if (cachedId) { Logger.log(`Using cached Category ID ${cachedId} for "${trimmedCategoryName}"`); return parseInt(cachedId, 10); }
+
+  const categoriesUrl = `${WP_URL.replace(/\/$/, "")}/wp-json/wp/v2/categories?search=${encodeURIComponent(trimmedCategoryName)}&per_page=5&orderby=count&order=desc`;
+  const options = { method: 'get', headers: { 'Authorization': 'Basic ' + basicAuth, 'User-Agent': 'AppsScript-News-Automation/1.1' }, muteHttpExceptions: true };
+
+  Logger.log(`Fetching WP Category ID for "${trimmedCategoryName}" (cache miss)...`);
+  let response, responseCode, responseBody;
+  try {
+    response = UrlFetchApp.fetch(categoriesUrl, options);
+    responseCode = response.getResponseCode();
+    responseBody = response.getContentText();
+
+    if (responseCode === 200) {
+        const categories = JSON.parse(responseBody);
+        if (categories && categories.length > 0) {
+            const foundCategory = categories.find(cat => cat.name.toLowerCase() === trimmedCategoryName.toLowerCase());
+            if (foundCategory && foundCategory.id) {
+                Logger.log(`Found exact match for "${trimmedCategoryName}": ID ${foundCategory.id}. Caching.`);
+                cache.put(cacheKey, foundCategory.id.toString(), 21600);
+                return foundCategory.id;
+            } else {
+                const returnedNames = categories.map(c => c.name).join(', ');
+                Logger.log(`Category "${trimmedCategoryName}" not found via exact match. Search returned: [${returnedNames}].`);
+                return null;
+            }
+        } else { Logger.log(`Category search for "${trimmedCategoryName}" returned no results.`); return null; }
+    } else {
+         let errorDetail = `Status ${responseCode}.`;
+         try { const errorJson = JSON.parse(responseBody); errorDetail += ` WP Msg: ${errorJson.message || JSON.stringify(errorJson)}`; }
+         catch(e) { errorDetail += ` Raw Resp: ${responseBody.substring(0,500)}`; }
+         Logger.log(`Error fetching WP categories: ${errorDetail}`);
+        throw new Error(`Failed to fetch WP Categories. ${errorDetail}`);
+    }
+  } catch (error) {
+      Logger.log(`Exception during category fetch: ${error.message}`);
+       if (error.message && WP_APP_PASSWORD && error.message.includes(WP_APP_PASSWORD)) { throw new Error("Error during WP Category fetch potentially involving credentials."); }
+      throw error;
+  }
+}
+
+// ==================================================================
+// Helper: Update Sheet Status, Timestamp, Post ID, Error Message
+// ==================================================================
+function updateSheetStatus(sheet, rowIndex, status, postId, errorMessage) {
+  try {
+    if (!sheet || typeof rowIndex !== 'number' || rowIndex < 2) {
+      Logger.log(`Error: Invalid parameters for updateSheetStatus. RowIndex: ${rowIndex}`);
+      return;
+    }
+
+    let updates = {};
+    let logMessage = `Updating sheet row ${rowIndex}: `;
+
+    if (status === 'Processing') {
+        updates[COLS.STATUS] = status;
+        updates[COLS.TIMESTAMP] = new Date();
+        updates[COLS.ERROR_MSG] = '';
+        logMessage += `Status="Processing"`;
+    } else if (status === 'Posted') {
+       updates[COLS.STATUS] = status;
+       updates[COLS.TIMESTAMP] = new Date();
+       if (postId && typeof postId === 'number' && postId > 0) {
+           updates[COLS.WP_POST_ID] = postId;
+           logMessage += `Status="Posted", PostID=${postId}`;
+       } else {
+           updates[COLS.WP_POST_ID] = 'Invalid ID';
+           logMessage += `Status="Posted", PostID=Invalid ID (${postId})`;
+           Logger.log(`Warning: Invalid PostID (${postId}) provided for 'Posted' status on row ${rowIndex}.`);
+       }
+       updates[COLS.ERROR_MSG] = '';
+    } else if (status === 'Error') {
+        updates[COLS.STATUS] = status;
+        updates[COLS.TIMESTAMP] = new Date();
+        const messageToLog = String(errorMessage || 'Unknown Error').substring(0, 500);
+        updates[COLS.ERROR_MSG] = messageToLog;
+        logMessage += `Status="Error", Error="${messageToLog.substring(0,100)}..."`;
+    } else {
+        Logger.log(`Attempted to set unrecognized status "${status}" for row ${rowIndex}. No update performed.`);
+        return;
+    }
+
+    const colsToUpdate = Object.keys(updates).map(Number).sort((a, b) => a - b);
+    if (colsToUpdate.length === 0) return;
+
+    for (const col of colsToUpdate) {
+        sheet.getRange(rowIndex, col).setValue(updates[col]);
+    }
+
+    SpreadsheetApp.flush();
+    Logger.log(logMessage);
+
+  } catch (error) {
+      Logger.log(`CRITICAL SHEET UPDATE FAILED for row ${rowIndex}. Status attempted: "${status}". Error: ${error.message}.`);
+  }
+}
